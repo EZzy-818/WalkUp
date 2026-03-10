@@ -1,0 +1,250 @@
+// ============================================================
+// Prisma Schema for WalkUp — Restaurant Waitlist Management
+// ============================================================
+// Prisma uses this file to:
+//   1. Generate the Prisma Client (type-safe DB access layer)
+//   2. Create and track database migrations
+//   3. Serve as the single source of truth for the DB schema
+// ============================================================
+
+// ------------------------------------
+// Generator block
+// ------------------------------------
+// Tells Prisma which client to generate. "prisma-client-js" is
+// the standard JS/TS client. Output ends up in node_modules/@prisma/client
+// after running `npx prisma generate`.
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ------------------------------------
+// Datasource block
+// ------------------------------------
+// Specifies the database engine (PostgreSQL) and where to connect.
+// DATABASE_URL is read from the .env file so we never hard-code
+// credentials in source control.
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+// Enums are enforced at the DB level as well as the application
+// level — Prisma will only accept the listed values.
+
+// Who is this account for? Diners browse/join waitlists;
+// restaurant owners manage their venues and queues.
+enum Role {
+  DINER
+  RESTAURANT_OWNER
+}
+
+// Tracks where a party is in the waitlist lifecycle:
+//   WAITING   — in queue, not yet notified
+//   NOTIFIED  — SMS sent that their table is ready
+//   SEATED    — confirmed seated, entry is complete
+//   NO_SHOW   — did not arrive within the deadline window
+//   CANCELLED — party cancelled voluntarily (or was removed)
+enum WaitlistStatus {
+  WAITING
+  NOTIFIED
+  SEATED
+  NO_SHOW
+  CANCELLED
+}
+
+// The kind of notification that was dispatched via Twilio:
+//   TABLE_READY — the main "your table is ready" ping
+//   REMINDER    — a follow-up nudge if no response
+//   REMOVED     — confirmation that the party was removed
+enum NotificationType {
+  TABLE_READY
+  REMINDER
+  REMOVED
+}
+
+// ============================================================
+// MODEL: User
+// ============================================================
+// Represents any human account in the system.
+// A single user can own multiple restaurants (one-to-many → restaurants).
+model User {
+  // UUID primary key — avoids leaking sequential IDs in URLs
+  id            String   @id @default(uuid())
+
+  // Must be globally unique; used for login
+  email         String   @unique
+
+  // Stores a bcrypt/argon2 hash — the plaintext password is NEVER stored
+  password_hash String
+
+  // Display name, shown in the UI
+  name          String
+
+  // Optional phone number for the restaurant owner contact
+  phone         String?
+
+  // Controls what the user can do in the app (see Role enum above)
+  role          Role     @default(DINER)
+
+  // Audit timestamp — auto-set on row creation, never updated
+  created_at    DateTime @default(now())
+
+  // ---- Relations ----
+  // A restaurant owner can have many restaurants.
+  // If this user's role is DINER this array will be empty.
+  restaurants   Restaurant[]
+
+  // A diner can appear on many waitlists across different restaurants.
+  waitlist_entries WaitlistEntry[]
+
+  // Map to the Postgres table name we actually want
+  @@map("users")
+}
+
+// ============================================================
+// MODEL: Restaurant
+// ============================================================
+// Represents a single physical restaurant registered in WalkUp.
+model Restaurant {
+  // UUID primary key
+  id                  String   @id @default(uuid())
+
+  // Foreign key back to the User who owns this restaurant.
+  // Using a String because the PK on User is also a String (uuid).
+  owner_id            String
+
+  // Human-readable name shown on the diner-facing UI
+  name                String
+
+  // Full street address — used for display and map directions
+  address             String
+
+  // Contact phone displayed to diners
+  phone               String?
+
+  // Geographic coordinates stored as floats.
+  // Together they let us support "nearby restaurants" queries later.
+  latitude            Float
+  longitude           Float
+
+  // Category displayed on search/browse screens (e.g., "Italian", "Ramen")
+  cuisine_type        String?
+
+  // Average number of minutes a table turn takes.
+  // Used to estimate wait times: position × avg_seating_minutes ≈ ETA.
+  // Defaults to 30 minutes as a reasonable starting estimate.
+  avg_seating_minutes Int      @default(30)
+
+  // Hard cap on simultaneous diners (used for capacity-based auto-close logic)
+  max_capacity        Int
+
+  // When false, the join-waitlist button is hidden/disabled for diners.
+  // The owner toggles this to open/close the queue each day.
+  is_waitlist_open    Boolean  @default(false)
+
+  // Audit timestamp
+  created_at          DateTime @default(now())
+
+  // ---- Relations ----
+  // Many-to-one back to the owning User
+  owner               User     @relation(fields: [owner_id], references: [id])
+
+  // One-to-many: all waitlist entries ever created for this restaurant
+  waitlist_entries    WaitlistEntry[]
+
+  @@map("restaurants")
+}
+
+// ============================================================
+// MODEL: WaitlistEntry
+// ============================================================
+// A single "spot in line" — created when a diner joins the queue.
+// Walk-ins (no app account) are supported via nullable user_id.
+model WaitlistEntry {
+  // UUID primary key
+  id              String          @id @default(uuid())
+
+  // Which restaurant's queue this entry belongs to
+  restaurant_id   String
+
+  // Nullable because walk-in guests may not have an app account.
+  // When present, links to the diner's User record.
+  user_id         String?
+
+  // Name to display / announce — always required even for walk-ins
+  guest_name      String
+
+  // How many seats to reserve when this party is seated
+  party_size      Int
+
+  // Phone number to send Twilio SMS notifications to
+  phone           String
+
+  // Current lifecycle state (see WaitlistStatus enum above)
+  status          WaitlistStatus  @default(WAITING)
+
+  // 1-based integer position in the queue.
+  // We recalculate positions after every SEATED / NO_SHOW / CANCELLED
+  // so the queue stays compact and the estimated wait times stay accurate.
+  position        Int
+
+  // When the party joined — used for age-of-wait calculations
+  joined_at       DateTime        @default(now())
+
+  // Set when the TABLE_READY notification is dispatched.
+  // Null until the owner clicks "Notify next party".
+  notified_at     DateTime?
+
+  // Set when the owner or system confirms the party is at the table.
+  // Null until actually seated.
+  seated_at       DateTime?
+
+  // The deadline by which the party must check in after being notified.
+  // If now() > no_show_deadline and status is still NOTIFIED, a job
+  // will flip status to NO_SHOW automatically.
+  no_show_deadline DateTime?
+
+  // ---- Relations ----
+  restaurant      Restaurant    @relation(fields: [restaurant_id], references: [id])
+
+  // Optional: present only when the diner has an app account
+  user            User?         @relation(fields: [user_id], references: [id])
+
+  // All notifications sent for this entry (TABLE_READY, REMINDER, etc.)
+  notifications   Notification[]
+
+  @@map("waitlist_entries")
+}
+
+// ============================================================
+// MODEL: Notification
+// ============================================================
+// Audit log of every outbound Twilio message sent by the system.
+// Keeping a record lets us retry failed sends, display status in
+// the owner dashboard, and avoid duplicate sends.
+model Notification {
+  // UUID primary key
+  id                String           @id @default(uuid())
+
+  // Which waitlist entry this notification is for
+  waitlist_entry_id String
+
+  // What kind of message was sent (see NotificationType enum)
+  type              NotificationType
+
+  // When the message was dispatched — auto-set on row creation
+  sent_at           DateTime         @default(now())
+
+  // The Twilio Message SID returned by the API.
+  // Nullable because we insert the record optimistically and then
+  // update it once Twilio responds. Also null in test environments.
+  twilio_sid        String?
+
+  // ---- Relations ----
+  waitlist_entry    WaitlistEntry @relation(fields: [waitlist_entry_id], references: [id])
+
+  @@map("notifications")
+}
